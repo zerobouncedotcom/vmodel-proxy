@@ -1,6 +1,4 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "api/vmodel-proxy.js", "use": "@vercel/node" }
-  ]
+  "routes": [{ "src": "/api/vmodel-proxy", "dest": "/api/vmodel-proxy.js" }]
 }
