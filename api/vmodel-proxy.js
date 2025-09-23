@@ -1,101 +1,102 @@
-// api/vmodel-proxy.ts (или .js)
+// api/vmodel-proxy.js
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
-};
+export const config = { runtime: 'nodejs18.x' }; // форсим Node, не Edge
 
-export default async function handler(req: any, res: any) {
-  // Префлайт
-  if (req.method === 'OPTIONS') {
-    res.setHeader('Access-Control-Max-Age', '600');
-    return res.status(204).setHeader('Vary', 'Origin').setHeader('Access-Control-Allow-Origin','*')
-      .setHeader('Access-Control-Allow-Methods','POST,OPTIONS')
-      .setHeader('Access-Control-Allow-Headers','Content-Type')
-      .end();
-  }
-
-  if (req.method !== 'POST') {
-    return res.status(405).setHeader('Content-Type','application/json').setHeader('Access-Control-Allow-Origin','*')
-      .json({ error: 'Method not allowed' });
-  }
-
+export default async function handler(req, res) {
   try {
-    const { source_url, target_url } = req.body || {};
-    if (!source_url || !target_url) {
-      return res.status(400).setHeader('Access-Control-Allow-Origin','*')
-        .json({ error: 'source_url & target_url required' });
+    // ---- CORS (дефенсив) ----
+    const reqAllowHeaders = String(
+      (req.headers && req.headers['access-control-request-headers']) || 'content-type'
+    );
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', reqAllowHeaders);
+    res.setHeader('Vary', 'Origin, Access-Control-Request-Headers');
+
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    if (req.method !== 'POST') {
+      res.status(405).json({ error: 'Method not allowed' });
+      return;
     }
 
-    // === вызов VModel (создать таск) ===
-    const token = process.env.VMODEL_TOKEN; // добавлен в Vercel → Settings → Environment Variables
-    const version = 'a3c8d261fd14126eecec/98812b52b40811e9ed557cec5706452888cdeebc0b6'; // из их страницы модели (Photo Face Swap Pro)
+    const token = process.env.VMODEL_TOKEN;
+    if (!token) {
+      res.status(500).json({ error: 'VMODEL_TOKEN is missing' });
+      return;
+    }
 
+    const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
+    const { source_url, target_url } = body;
+    if (!source_url || !target_url) {
+      res.status(400).json({ error: 'source_url & target_url required' });
+      return;
+    }
+
+    // модель vmodel photo-face-swap-pro (как в их UI)
+    const version = 'a3c8d261fd14126eecec/98812b52b40811e9ed557cec5706452888cdeebc0b6';
+
+    // 1) create
     const create = await fetch('https://api.vmodel.ai/api/tasks/v1/create', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: `vmodel/photo-face-swap-pro:${version}`,
         input: {
-          swap_image:   target_url, // у них "swap_image" — лицо, которое вставляем
-          target_image: source_url, // а это — фото, куда вставляем
-          disable_safety_checker: false,
-        },
-      }),
+          // swap_image — ЧЬЕ лицо; target_image — КУДА ставим
+          swap_image: target_url,
+          target_image: source_url,
+          disable_safety_checker: false
+        }
+      })
     });
 
-    const createJson = await create.json();
+    const cj = await create.json().catch(() => ({}));
     if (!create.ok) {
-      return res.status(502).setHeader('Access-Control-Allow-Origin','*')
-        .json({ error: 'vmodel create failed', details: createJson });
+      res.status(502).json({ error: 'vmodel create failed', details: cj });
+      return;
     }
 
-    const taskId = createJson?.id || createJson?.data?.id;
+    const taskId = cj?.id || cj?.data?.id;
     if (!taskId) {
-      return res.status(502).setHeader('Access-Control-Allow-Origin','*')
-        .json({ error: 'no task id from vmodel', raw: createJson });
+      res.status(502).json({ error: 'no task id', raw: cj });
+      return;
     }
 
-    // === опрос статуса (до 45с) ===
-    const until = Date.now() + 45_000;
-    let resultUrl: string | null = null;
-    let last: any = null;
+    // 2) poll (до 45 сек)
+    const deadline = Date.now() + 45_000;
+    let outUrl = null, last = null;
 
-    while (Date.now() < until) {
+    while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 2000));
       const r = await fetch(`https://api.vmodel.ai/api/tasks/v1/get?id=${encodeURIComponent(taskId)}`, {
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
-      const j = await r.json();
+      const j = await r.json().catch(() => ({}));
       last = j;
 
       const status = j?.status || j?.data?.status;
       if (status === 'succeeded' || status === 'completed') {
         const files = j?.output?.files || j?.data?.output?.files || [];
-        resultUrl = files[0]?.content_url || files[0]?.url || null;
+        outUrl = files?.[0]?.content_url || files?.[0]?.url || null;
         break;
       }
       if (status === 'failed') {
-        return res.status(502).setHeader('Access-Control-Allow-Origin','*')
-          .json({ error: 'vmodel task failed', details: j });
+        res.status(502).json({ error: 'vmodel task failed', details: j });
+        return;
       }
     }
 
-    if (!resultUrl) {
-      return res.status(504).setHeader('Access-Control-Allow-Origin','*')
-        .json({ error: 'timeout waiting vmodel', last });
+    if (!outUrl) {
+      res.status(504).json({ error: 'timeout', last });
+      return;
     }
 
-    // Можно сразу отдать ссылку
-    return res.status(200).setHeader('Access-Control-Allow-Origin','*')
-      .json({ url: resultUrl });
-
-  } catch (e:any) {
-    return res.status(500).setHeader('Access-Control-Allow-Origin','*')
-      .json({ error: String(e) });
+    res.status(200).json({ url: outUrl });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.stack || e) });
   }
 }
