@@ -1,4 +1,8 @@
 {
   "version": 2,
-  "routes": [{ "src": "/api/vmodel-proxy", "dest": "/api/vmodel-proxy.js" }]
+  "functions": {
+    "api/vmodel-proxy.js": {
+      "runtime": "nodejs16.x"
+    }
+  }
 }
