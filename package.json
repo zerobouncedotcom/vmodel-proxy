@@ -1,7 +1,10 @@
 {
-  "name": "mot-inpaint-api",
+  "name": "vmodel-proxy",
   "private": true,
   "type": "module",
-  "dependencies": {},
-  "engines": { "node": ">=18" }
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "micro": "9.4.1",
+    "node-fetch": "3.3.2"
+  }
 }
