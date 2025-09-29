@@ -1,8 +1,0 @@
-{
-  "version": 2,
-  "functions": {
-    "api/vmodel-proxy.js": {
-      "runtime": "nodejs16.x"
-    }
-  }
-}
