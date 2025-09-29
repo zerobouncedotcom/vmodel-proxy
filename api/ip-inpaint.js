@@ -1,14 +1,17 @@
+// api/ip-inpaint.js
+
 export const config = {
-  api: {
-    bodyParser: {
-      sizeLimit: '10mb', // чтобы пролезал dataURL
-    },
-  },
+  api: { bodyParser: { sizeLimit: '15mb' } }, // запас по размеру
 };
 
 export default async function handler(req, res) {
+  // --- CORS ---
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
+    res.setHeader('Allow', 'POST, OPTIONS');
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
@@ -18,79 +21,84 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { template_url, mask_url, donor_data_url, prompt = '' } = req.body || {};
+    const {
+      template_url,   // картинка-шаблон (с МОТ и пустым местом)
+      mask_url,       // чёрно-белая маска (белое = перерисовать)
+      donor_data_url, // URL фото юзера (то, что загрузили на imgbb/s3 и т.п.)
+      prompt = '',    // можно оставить пустым
+      strength = 0.85,
+      image_guidance_scale = 1.5,
+      num_inference_steps = 28
+    } = req.body || {};
+
     if (!template_url || !mask_url || !donor_data_url) {
       return res.status(400).json({ error: 'template_url, mask_url, donor_data_url are required' });
     }
 
-    // Создаём prediction на последней версии модели (без явного version-хэша):
-    const createResp = await fetch(
-      'https://api.replicate.com/v1/models/lucataco/ip_adapter-face-inpaint/predictions',
-      {
-        method: 'POST',
-        headers: {
-          'Authorization': `Token ${REPLICATE_TOKEN}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          input: {
-            // базовые параметры; правь по вкусу
-            image: template_url,       // наш шаблон с МОТ
-            mask: mask_url,            // белая область = заменять
-            ip_image: donor_data_url,  // фото пользователя (dataURL)
-            prompt: prompt || 'Replace masked head using the reference face photo, keep lighting and context natural.',
-            negative_prompt: '',
-            num_inference_steps: 28,
-            guidance_scale: 3,
-            strength: 0.85,
-            seed: null
-          }
-        })
-      }
-    );
+    // 1) Создаём prediction
+    const create = await fetch('https://api.replicate.com/v1/models/lucataco/ip_adapter-face-inpaint/predictions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Token ${REPLICATE_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        input: {
+          source_image: template_url,
+          face_image: donor_data_url,
+          mask: mask_url,
+          prompt,
+          image_guidance_scale,
+          strength,
+          num_inference_steps
+        }
+      })
+    });
 
-    if (!createResp.ok) {
-      const t = await createResp.text();
-      return res.status(createResp.status).json({ error: `Replicate create error: ${t}` });
+    if (!create.ok) {
+      const text = await create.text();
+      return res.status(create.status).json({ error: `replicate create failed: ${text}` });
     }
 
-    const prediction = await createResp.json();
-    const statusUrl = prediction?.urls?.get;
-    if (!statusUrl) {
-      return res.status(500).json({ error: 'No status URL from Replicate' });
-    }
+    const job = await create.json();
+    const id = job?.id || job?.uuid || job?.idempotency_key || job?.output?.id;
+    if (!id) return res.status(502).json({ error: 'replicate: no prediction id in response', raw: job });
 
-    // Пулим статус до готовности
+    // 2) Пулим статус до 60с
     const started = Date.now();
-    const timeoutMs = 120000; // 2 минуты
+    const deadline = started + 60_000;
 
-    async function poll() {
-      const r = await fetch(statusUrl, { headers: { 'Authorization': `Token ${REPLICATE_TOKEN}` }});
-      if (!r.ok) {
-        const t = await r.text();
-        throw new Error(`Replicate status error: ${t}`);
+    let last;
+    while (Date.now() < deadline) {
+      const poll = await fetch(`https://api.replicate.com/v1/predictions/${id}`, {
+        headers: { Authorization: `Token ${REPLICATE_TOKEN}` }
+      });
+
+      if (!poll.ok) {
+        const t = await poll.text();
+        return res.status(poll.status).json({ error: `replicate poll failed: ${t}` });
       }
-      const body = await r.json();
-      if (body.status === 'succeeded') {
-        const out = body.output;
+
+      last = await poll.json();
+
+      if (last.status === 'succeeded') {
+        const out = last.output;
+        // output у Replicate — это массив URL’ов или один URL
         const url = Array.isArray(out) ? out[0] : out;
-        return url;
+        return res.status(200).json({ url, replicate_id: id });
       }
-      if (body.status === 'failed' || body.status === 'canceled') {
-        throw new Error(`Replicate failed: ${body.error || body.status}`);
+
+      if (last.status === 'failed' || last.status === 'canceled') {
+        return res.status(502).json({ error: `replicate status=${last.status}`, detail: last });
       }
-      if (Date.now() - started > timeoutMs) {
-        throw new Error('Timeout waiting for Replicate');
-      }
-      await new Promise(r => setTimeout(r, 2500));
-      return poll();
+
+      // queued / starting / processing
+      await new Promise(r => setTimeout(r, 2000));
     }
 
-    const outputUrl = await poll();
-    return res.status(200).json({ output_url: outputUrl });
-
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: String(err?.message || err) });
+    return res.status(504).json({ error: 'timeout waiting replicate', last });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: e?.message || 'server error' });
   }
 }
