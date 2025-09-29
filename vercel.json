@@ -1,7 +1,9 @@
 {
+  "version": 2,
   "functions": {
-    "api/inpaint.js": {
-      "runtime": "nodejs18.x"
-    }
-  }
+    "api/**/*.js": { "runtime": "nodejs20.x" }
+  },
+  "routes": [
+    { "src": "/api/inpaint", "dest": "/api/inpaint.js" }
+  ]
 }
